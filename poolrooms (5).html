@@ -1,0 +1,1705 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>THE POOLROOMS — A-Frame Explorer</title>
+
+<script src="https://aframe.io/releases/1.7.0/aframe.min.js"></script>
+
+<style>
+html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #000; font-family: system-ui, sans-serif; }
+
+#hud {
+  position: fixed; top: 14px; left: 14px; z-index: 5; padding: 10px 13px;
+  color: #d8efea; background: #071013bb; border: 1px solid #9ccbc533;
+  border-radius: 10px; font-size: 13px; line-height: 1.6;
+  pointer-events: none; backdrop-filter: blur(8px);
+}
+#hint { color: #a9c9c3; }
+
+#crosshair {
+  position: fixed; left: 50%; top: 50%; width: 5px; height: 5px; border-radius: 50%;
+  background: white; opacity: .7; transform: translate(-50%, -50%);
+  pointer-events: none; z-index: 4;
+}
+
+/* Underwater darkening overlay (sits above the scene, below the HUD) */
+#dark {
+  position: fixed; inset: 0; z-index: 3; background: #00070a;
+  opacity: 0; pointer-events: none;
+}
+
+#start {
+  position: fixed; inset: 0; z-index: 10; display: grid; place-items: center;
+  background: radial-gradient(ellipse, #12282a, #000); padding: 24px; text-align: center;
+}
+#panel {
+  max-width: 430px; background: #0b1719; border: 1px solid #9ccbc544;
+  border-radius: 16px; padding: 24px; box-shadow: 0 15px 60px #0009;
+}
+h1 { font-size: 24px; letter-spacing: .04em; color: #e4f4f0; }
+p { color: #b8ceca; line-height: 1.5; }
+button {
+  background: #c4e8df; color: #10201e; border: 0; border-radius: 9px;
+  padding: 12px 18px; font-weight: 700; font-size: 15px; cursor: pointer;
+}
+</style>
+</head>
+
+<body>
+
+<div id="hud">
+  POOLROOMS / LEVEL 01<br>
+  <span id="hint">WASD Move · Shift Sprint · C Crouch · Space Jump / hold to Swim · F Flashlight · Esc Unlock</span>
+  <br>
+  <span id="flashStatus">FLASHLIGHT: OFF</span><br>
+  <span id="sprintStatus">SPRINT: READY</span><br>
+  <span id="stanceStatus">STANCE: STANDING</span><br>
+  <span id="depthStatus">WATER DEPTH: 0.0 m</span><br>
+  <span id="areaStatus">AREA: LIT</span>
+</div>
+
+<div id="crosshair"></div>
+<div id="dark"></div>
+
+<div id="start">
+  <div id="panel">
+    <h1>THE POOLROOMS</h1>
+    <p>A quiet, procedurally assembled maze of white-tiled halls, sunken pools, and endless corridors.</p>
+    <p>Pools are real basins with sloped, terraced floors. Wading through water slows you by 20%. Some pools are far deeper than they look. In deep water, hold Space to swim, or let go and sink. Stay under too long and your vision fades.</p>
+    <p><b>Controls:</b> WASD to move, Shift to sprint, C to crouch (hold), mouse to look, Space to jump (hold Space in deep water to swim), F to toggle flashlight.</p>
+    <button id="begin">ENTER</button>
+  </div>
+</div>
+
+<a-scene
+  poolrooms
+  renderer="antialias: true; colorManagement: true; physicallyCorrectLights: true; maxCanvasWidth: 1920; maxCanvasHeight: 1080"
+  vr-mode-ui="enabled: false"
+  loading-screen="enabled: false"
+  background="color: #050d0e"
+  fog="type: exponential; color: #050d0e; density: 0.011"
+>
+
+  <a-entity id="world"></a-entity>
+
+  <!-- Soft fill lighting so the white tile actually reads as white -->
+  <a-entity light="type: hemisphere; color: #eafffb; groundColor: #5b8c8d; intensity: 1.0"></a-entity>
+  <a-entity light="type: ambient; color: #cfe9e6; intensity: 0.25"></a-entity>
+
+  <!-- PLAYER -->
+  <a-entity id="player" position="0 0 0" explorer>
+
+    <a-camera
+      id="camera"
+      position="0 1.7 0"
+      look-controls="pointerLockEnabled: true"
+      wasd-controls="enabled: false"
+      fov="74"
+    >
+
+      <!-- FLASHLIGHT -->
+      <a-entity
+        id="flashlight"
+        light="type: spot; target: #flashTarget; color: #e0fff7; intensity: 0; distance: 80; angle: 34; penumbra: 0.18; decay: 1.5"
+        position="0 0 0"
+      ></a-entity>
+
+      <a-entity id="flashTarget" position="0 0 -15"></a-entity>
+
+    </a-camera>
+
+  </a-entity>
+</a-scene>
+
+<script>
+
+// ==========================================
+// SHARED WORLD DATA (used by player component)
+// ==========================================
+
+const SPRINT_MULT = 1.4;       // +40% speed
+const SPRINT_TIME = 5;         // seconds of sprint available
+const SPRINT_COOLDOWN = 6;     // seconds locked out after running dry
+const CROUCH_MULT = 0.4;       // -60% speed
+const STAND_EYE = 1.7, CROUCH_EYE = 1.0;
+const FLASH_INTENSITY = 45;    // was 90 (-50%)
+
+const BEAM_COVER = 0.35;   // flashlight cone covers this fraction of the screen
+
+// ---- Wading ----
+const WATER_MULT = 0.8;        // any water slows walking by a flat 20% (whatever the depth)
+
+// ---- Swimming ----
+const SWIM_MIN = 1.0;          // water must be at least this deep (m) to swim
+const SWIM_MULT = 0.8;         // swim speed = 80% of normal walking (20% slower)
+const SWIM_SURFACE_EYE = 0.3;  // eyes float this far above the surface while swimming
+const SINK_SPEED = 2.2;        // max sink speed (m/s) in deep water when not holding Space
+
+// ---- Underwater darkening ----
+const DARKEN_TIME = 14;        // seconds fully submerged until the view is nearly black
+const DARKEN_MAX = 0.96;       // maximum overlay opacity
+const DARKEN_RECOVER = 2.5;    // how fast vision returns once out of the water (per second)
+
+const POOL = {
+  waterY: -0.1,
+  heightAt: () => 0,
+  collide: (x, z) => [x, z],
+  lightAt: () => 1,
+  ceilingAt: () => 99,
+  limit: 100
+};
+
+// ==========================================
+// SOUND: faint echoing footsteps + random water drips
+// Everything is synthesized with the Web Audio API (no audio files).
+// ==========================================
+
+const DRIP_MIN = 1.0;          // seconds between drips: random in [DRIP_MIN, DRIP_MAX]
+const DRIP_MAX = 10.0;
+
+const Sound = (() => {
+
+  let ctx = null, bus = null, send = null, muffle = null, noiseBuf = null;
+
+  function impulse(c, seconds, decay) {
+    const len = Math.floor(c.sampleRate * seconds);
+    const buf = c.createBuffer(2, len, c.sampleRate);
+    for (let ch = 0; ch < 2; ch++) {
+      const d = buf.getChannelData(ch);
+      for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
+    }
+    return buf;
+  }
+
+  function init() {
+
+    if (ctx) { if (ctx.state === 'suspended') ctx.resume(); return; }
+
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+
+    ctx = new AC();
+
+    // Output (low-pass is opened up normally, closed when you go underwater)
+    muffle = ctx.createBiquadFilter();
+    muffle.type = 'lowpass';
+    muffle.frequency.value = 20000;
+    muffle.connect(ctx.destination);
+
+    bus = ctx.createGain();
+    bus.connect(muffle);
+
+    // Echo: one soft repeating delay plus a little room reverb
+    send = ctx.createGain();
+
+    const delay = ctx.createDelay(1.0);
+    delay.delayTime.value = 0.23;
+    const fb = ctx.createGain();
+    fb.gain.value = 0.3;
+    const dlp = ctx.createBiquadFilter();
+    dlp.type = 'lowpass';
+    dlp.frequency.value = 1800;
+    const echoOut = ctx.createGain();
+    echoOut.gain.value = 0.35;
+
+    send.connect(delay);
+    delay.connect(dlp);
+    dlp.connect(fb);
+    fb.connect(delay);
+    dlp.connect(echoOut);
+    echoOut.connect(muffle);
+
+    const conv = ctx.createConvolver();
+    conv.buffer = impulse(ctx, 2.2, 3);
+    const convOut = ctx.createGain();
+    convOut.gain.value = 0.5;
+
+    send.connect(conv);
+    conv.connect(convOut);
+    convOut.connect(muffle);
+
+    // shared white noise
+    noiseBuf = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
+    const nd = noiseBuf.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+
+    scheduleDrip();
+  }
+
+  // dry -> out, plus a send level into the echo
+  function route(node, pan, sendLevel) {
+    let out = node;
+    if (ctx.createStereoPanner) {
+      const p = ctx.createStereoPanner();
+      p.pan.value = pan;
+      node.connect(p);
+      out = p;
+    }
+    out.connect(bus);
+    const s = ctx.createGain();
+    s.gain.value = sendLevel;
+    out.connect(s);
+    s.connect(send);
+  }
+
+  let foot = 1;   // alternates left / right
+
+  function step(wet, vol) {
+
+    if (!ctx || ctx.state !== 'running') return;
+
+    const t = ctx.currentTime;
+    foot = -foot;
+
+    // soft noise "scuff"
+    const src = ctx.createBufferSource();
+    src.buffer = noiseBuf;
+    src.playbackRate.value = 0.8 + Math.random() * 0.4;
+
+    const f = ctx.createBiquadFilter();
+    f.type = wet ? 'bandpass' : 'lowpass';
+    f.frequency.value = wet ? 1400 + Math.random() * 600 : 650 + Math.random() * 350;
+    f.Q.value = wet ? 0.8 : 0.7;
+
+    const dur = wet ? 0.22 : 0.11;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime((wet ? 1.5 : 2.2) * vol, t + 0.004);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+
+    src.connect(f);
+    f.connect(g);
+    route(g, foot * 0.15, 0.4);
+
+    src.start(t, Math.random() * 0.5);
+    src.stop(t + dur + 0.05);
+
+    // low thump for weight (dry floor only)
+    if (!wet) {
+      const o = ctx.createOscillator();
+      o.type = 'sine';
+      o.frequency.setValueAtTime(120, t);
+      o.frequency.exponentialRampToValueAtTime(55, t + 0.08);
+      const og = ctx.createGain();
+      og.gain.setValueAtTime(0.0001, t);
+      og.gain.linearRampToValueAtTime(0.35 * vol, t + 0.004);
+      og.gain.exponentialRampToValueAtTime(0.0001, t + 0.09);
+      o.connect(og);
+      route(og, foot * 0.15, 0.3);
+      o.start(t);
+      o.stop(t + 0.12);
+    }
+  }
+
+  function drip() {
+
+    if (!ctx || ctx.state !== 'running') return;
+
+    const t = ctx.currentTime;
+
+    const o = ctx.createOscillator();
+    o.type = 'sine';
+    const f0 = 700 + Math.random() * 900;
+    o.frequency.setValueAtTime(f0, t);
+    o.frequency.exponentialRampToValueAtTime(f0 * 1.9, t + 0.06);   // droplets "plink" upward
+
+    const g = ctx.createGain();
+    const vol = 0.05 + Math.random() * 0.09;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(vol, t + 0.005);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+
+    o.connect(g);
+    route(g, (Math.random() - 0.5) * 1.6, 0.9);   // heavier echo: reads as distant
+
+    o.start(t);
+    o.stop(t + 0.3);
+  }
+
+  function scheduleDrip() {
+    const wait = (DRIP_MIN + Math.random() * (DRIP_MAX - DRIP_MIN)) * 1000;
+    setTimeout(() => { drip(); scheduleDrip(); }, wait);
+  }
+
+  function setMuffled(on) {
+    if (ctx) muffle.frequency.setTargetAtTime(on ? 450 : 20000, ctx.currentTime, 0.08);
+  }
+
+  return { init, step, setMuffled };
+
+})();
+
+
+// ==========================================
+// PROCEDURAL POOLROOMS GENERATOR
+// ==========================================
+
+AFRAME.registerComponent('poolrooms', {
+
+  init: function () {
+
+    const scene = this.el.object3D;
+
+    // ---- Level size: 21 x 21 cells of 10 m = 210 m x 210 m (was 90 m) ----
+    const N = 21;
+    const CELL = 10;
+    const WORLD = N * CELL;
+    const HALF = WORLD / 2;
+
+    const DEEP_MAX = 9.5;                 // deepest possible "extremely deep" pool
+    const BOTTOM = -(DEEP_MAX + 1.0);     // walls and pillars sink below the deepest pool
+    const TOP = 60.0;                     // top of the tallest possible ceiling
+    const WALL_H = TOP - BOTTOM;
+    const WALL_CY = (TOP + BOTTOM) / 2;
+
+    const rng = (() => {
+      let seed = 20261120;
+      return () => {
+        seed = (seed * 1664525 + 1013904223) >>> 0;
+        return seed / 4294967296;
+      };
+    })();
+
+    // Separate stream for the new features, so the original layout stays the same.
+    const rng3 = (() => {
+      let sd = 4242424;
+      return () => { sd = (sd * 1664525 + 1013904223) >>> 0; return sd / 4294967296; };
+    })();
+
+    // --------------------------------------
+    // TILE TEXTURES (procedural, white ceramic)
+    // --------------------------------------
+
+    const TEX_WORLD = 1.2;   // one texture covers 1.2 m
+    const TILES = 4;         // 4 x 4 tiles per texture, so 0.3 m tiles
+
+    function tileCanvas(kind) {
+
+      const S = 512, t = S / TILES, g = 5;
+      const c = document.createElement('canvas');
+      c.width = c.height = S;
+      const x = c.getContext('2d');
+
+      x.fillStyle = kind === 'color' ? '#8d9f9c' : '#000';
+      x.fillRect(0, 0, S, S);
+
+      for (let i = 0; i < TILES; i++) {
+        for (let j = 0; j < TILES; j++) {
+
+          const px = i * t + g / 2, py = j * t + g / 2, s = t - g;
+
+          if (kind === 'color') {
+
+            const v = 238 + Math.floor(Math.random() * 14);
+            x.fillStyle = `rgb(${v},${v + 4},${v + 3})`;
+            x.fillRect(px, py, s, s);
+
+            // soft glaze gradient
+            const gr = x.createLinearGradient(px, py, px + s, py + s);
+            gr.addColorStop(0, 'rgba(255,255,255,0.35)');
+            gr.addColorStop(1, 'rgba(120,150,150,0.10)');
+            x.fillStyle = gr;
+            x.fillRect(px, py, s, s);
+
+            // bevelled edges
+            x.fillStyle = 'rgba(255,255,255,0.9)';
+            x.fillRect(px, py, s, 2);
+            x.fillRect(px, py, 2, s);
+            x.fillStyle = 'rgba(70,100,100,0.18)';
+            x.fillRect(px, py + s - 2, s, 2);
+            x.fillRect(px + s - 2, py, 2, s);
+
+          } else {
+
+            x.fillStyle = '#fff';
+            x.fillRect(px, py, s, s);
+
+          }
+        }
+      }
+
+      if (kind === 'color') {
+        for (let i = 0; i < 2500; i++) {
+          x.fillStyle = `rgba(80,110,110,${Math.random() * 0.05})`;
+          x.fillRect(Math.random() * S, Math.random() * S, 1.5, 1.5);
+        }
+      }
+
+      return c;
+    }
+
+    function makeTex(canvas, srgb) {
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+      tex.anisotropy = 8;
+      if (srgb) tex.colorSpace = THREE.SRGBColorSpace;
+      return tex;
+    }
+
+    const tileTex = makeTex(tileCanvas('color'), true);
+    const tileBump = makeTex(tileCanvas('bump'), false);
+
+    function tileMaterial(color, rough, extra) {
+      return new THREE.MeshStandardMaterial(Object.assign({
+        color,
+        map: tileTex,
+        bumpMap: tileBump,
+        bumpScale: 1.5,
+        roughness: rough,
+        metalness: 0.0
+      }, extra || {}));
+    }
+
+    const wallMat = tileMaterial(0xf6faf9, 0.45);
+    const ceilingMat = tileMaterial(0xe6eeee, 0.7);
+    const floorMat = tileMaterial(0xffffff, 0.32, { vertexColors: true });
+
+    const pillarTex = tileTex.clone();
+    pillarTex.repeat.set(2, WALL_H / 1.6);
+    pillarTex.needsUpdate = true;
+    const pillarMat = new THREE.MeshStandardMaterial({
+      color: 0xf0f6f5, map: pillarTex, roughness: 0.4
+    });
+
+    const panelMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff, emissive: 0xe4fff8, emissiveIntensity: 1.3, roughness: 0.6
+    });
+
+    // --------------------------------------
+    // DARK ZONES + PITCH-BLACK HEIGHTS
+    // Ambient and emissive light is scaled down inside a few zones.
+    // The flashlight is a real light, so it is not affected by that.
+    //
+    // Separately, everything above y = BLACK_START fades to pure black
+    // AFTER lighting, so no light (flashlight included) can reveal it.
+    // Normal ceilings (max 8.4 m) sit below the fade.
+    // --------------------------------------
+
+    const MAXZ = 6;
+    const zoneU = { value: Array.from({ length: MAXZ }, () => new THREE.Vector4(0, 0, 1, 0)) };
+
+    const BLACK_START = 10.0, BLACK_END = 19.0;
+
+    function litPatch(mat) {
+
+      mat.onBeforeCompile = (sh) => {
+
+        sh.uniforms.uZones = zoneU;
+
+        sh.vertexShader = sh.vertexShader
+          .replace('#include <common>', '#include <common>\nvarying vec3 vWP;')
+          .replace('#include <begin_vertex>',
+            '#include <begin_vertex>\nvec4 wp_ = vec4(transformed, 1.0);\n#ifdef USE_INSTANCING\nwp_ = instanceMatrix * wp_;\n#endif\nvWP = (modelMatrix * wp_).xyz;');
+
+        sh.fragmentShader = sh.fragmentShader
+          .replace('#include <common>',
+            '#include <common>\nvarying vec3 vWP;\nuniform vec4 uZones[' + MAXZ + '];\n' +
+            'float zoneLight() { float l = 1.0; for (int i = 0; i < ' + MAXZ + '; i++) {' +
+            ' vec4 z = uZones[i]; float d = distance(vWP.xz, z.xy);' +
+            ' float t = 1.0 - smoothstep(z.z * 0.55, z.z, d); l = min(l, 1.0 - z.w * t); } return l; }')
+          .replace('#include <emissivemap_fragment>',
+            '#include <emissivemap_fragment>\ntotalEmissiveRadiance *= zoneLight();')
+          .replace('#include <lights_fragment_end>',
+            '#include <lights_fragment_end>\n{ float zl_ = zoneLight(); reflectedLight.indirectDiffuse *= zl_; reflectedLight.indirectSpecular *= zl_; }')
+          .replace('#include <dithering_fragment>',
+            '#include <dithering_fragment>\n' +
+            'gl_FragColor.rgb *= 1.0 - smoothstep(' + BLACK_START.toFixed(1) + ', ' + BLACK_END.toFixed(1) + ', vWP.y);');
+      };
+    }
+
+    [wallMat, ceilingMat, floorMat, pillarMat, panelMat].forEach(litPatch);
+
+    // --------------------------------------
+    // GEOMETRY HELPERS
+    // --------------------------------------
+
+    // Box whose UVs follow real-world size, so tiles keep a constant scale.
+    const geoCache = {};
+
+    function slabGeo(sx, sy, sz) {
+
+      const key = sx + '|' + sy + '|' + sz;
+      if (geoCache[key]) return geoCache[key];
+
+      const geo = new THREE.BoxGeometry(sx, sy, sz);
+      const uv = geo.attributes.uv;
+      const dims = [[sz, sy], [sz, sy], [sx, sz], [sx, sz], [sx, sy], [sx, sy]];
+
+      for (let f = 0; f < 6; f++) {
+        for (let v = 0; v < 4; v++) {
+          const i = f * 4 + v;
+          uv.setXY(i, uv.getX(i) * dims[f][0] / TEX_WORLD, uv.getY(i) * dims[f][1] / TEX_WORLD);
+        }
+      }
+
+      geoCache[key] = geo;
+      return geo;
+    }
+
+    function instanced(geo, mat, list) {
+
+      const mesh = new THREE.InstancedMesh(geo, mat, list.length);
+      const m = new THREE.Matrix4();
+
+      list.forEach((p, i) => {
+        m.makeTranslation(p[0], p[1], p[2]);
+        mesh.setMatrixAt(i, m);
+      });
+
+      mesh.instanceMatrix.needsUpdate = true;
+      mesh.frustumCulled = false;
+      scene.add(mesh);
+      return mesh;
+    }
+
+    // --------------------------------------
+    // COLLISION (walls and pillars)
+    // --------------------------------------
+
+    const buckets = new Map();
+    const bkey = (cx, cz) => cx * 1000 + cz;
+    const cellOf = (v) => Math.max(0, Math.min(N - 1, Math.floor((v + HALF) / CELL)));
+
+    function addSolid(minx, maxx, minz, maxz) {
+      const b = [minx, maxx, minz, maxz];
+      for (let cx = cellOf(minx); cx <= cellOf(maxx); cx++) {
+        for (let cz = cellOf(minz); cz <= cellOf(maxz); cz++) {
+          const k = bkey(cx, cz);
+          if (!buckets.has(k)) buckets.set(k, []);
+          buckets.get(k).push(b);
+        }
+      }
+    }
+
+    POOL.collide = function (x, z, r) {
+
+      const cx = cellOf(x), cz = cellOf(z);
+
+      for (let pass = 0; pass < 2; pass++) {
+        for (let ax = cx - 1; ax <= cx + 1; ax++) {
+          for (let az = cz - 1; az <= cz + 1; az++) {
+
+            const list = buckets.get(bkey(ax, az));
+            if (!list) continue;
+
+            for (const b of list) {
+
+              const nx = Math.max(b[0], Math.min(b[1], x));
+              const nz = Math.max(b[2], Math.min(b[3], z));
+              const dx = x - nx, dz = z - nz;
+              const d2 = dx * dx + dz * dz;
+
+              if (d2 < r * r) {
+                if (d2 > 1e-8) {
+                  const d = Math.sqrt(d2);
+                  x = nx + dx / d * r;
+                  z = nz + dz / d * r;
+                } else {
+                  x += r; // fully inside, shove out
+                }
+              }
+            }
+          }
+        }
+      }
+
+      return [x, z];
+    };
+
+    // --------------------------------------
+    // POOL DEPTH MAP
+    // --------------------------------------
+
+    const RES = 0.5;
+    const G = Math.round(WORLD / RES) + 1;
+    const depth = new Float32Array(G * G);
+    const MAX_DEPTH = 2.4;          // depth of a "normal" deep pool
+
+    const DEEP_CHANCE = 0.06;       // chance per pool of being extremely deep
+    const DEEP_MIN = 5.5;           // extremely deep pools: 5.5 m ... DEEP_MAX
+
+    const smooth = (t) => t * t * (3 - 2 * t);
+
+    // Terraced profile: smooth bowl plus shallow ledges
+    function profile(t) {
+      const s = smooth(Math.min(1, t * 1.25));
+      return 0.65 * s + 0.35 * (Math.floor(s * 4) / 4);
+    }
+
+    function carve(minX, maxX, minZ, maxZ, fn) {
+
+      const i0 = Math.max(0, Math.floor((minX + HALF) / RES));
+      const i1 = Math.min(G - 1, Math.ceil((maxX + HALF) / RES));
+      const j0 = Math.max(0, Math.floor((minZ + HALF) / RES));
+      const j1 = Math.min(G - 1, Math.ceil((maxZ + HALF) / RES));
+
+      for (let j = j0; j <= j1; j++) {
+        for (let i = i0; i <= i1; i++) {
+
+          const d = fn(-HALF + i * RES, -HALF + j * RES);
+
+          if (d > depth[j * G + i]) depth[j * G + i] = d;
+        }
+      }
+    }
+
+    // Irregular pools with varying depth (rarely extremely deep)
+    for (let n = 0; n < 90; n++) {
+
+      const cx = (rng() - 0.5) * (WORLD - 14);
+      const cz = (rng() - 0.5) * (WORLD - 14);
+      let r = 2.5 + rng() * 7.5;
+      let D = 0.45 + rng() * (MAX_DEPTH - 0.45);
+      const p1 = rng() * 6.28, p2 = rng() * 6.28;
+      const stretch = 0.7 + rng() * 0.8;
+
+      // Rare abyss pool: much deeper, and wide enough that the slope stays swimmable
+      if (rng3() < DEEP_CHANCE) {
+        D = DEEP_MIN + rng3() * (DEEP_MAX - DEEP_MIN);
+        r = Math.max(r, 4.5 + rng3() * 2.5);
+      }
+
+      if (Math.hypot(cx, cz) < r + 7) continue;   // keep spawn dry
+
+      carve(cx - r * 1.5, cx + r * 1.5, cz - r * 1.5, cz + r * 1.5, (x, z) => {
+
+        const dx = x - cx, dz = (z - cz) * stretch;
+        const dist = Math.hypot(dx, dz);
+        const ang = Math.atan2(dz, dx);
+        const rr = r * (1 + 0.22 * Math.sin(3 * ang + p1) + 0.12 * Math.sin(5 * ang + p2));
+        const t = 1 - dist / rr;
+
+        return t > 0 ? D * profile(t) : 0;
+      });
+    }
+
+    // Winding channels
+    for (let n = 0; n < 16; n++) {
+
+      let x = (rng() - 0.5) * (WORLD - 20);
+      let z = (rng() - 0.5) * (WORLD - 20);
+      let a = rng() * 6.28;
+
+      const w = 1.2 + rng() * 1.8;
+      const D = 0.4 + rng() * 1.1;
+      const segs = 6 + Math.floor(rng() * 6);
+
+      for (let s = 0; s < segs; s++) {
+
+        const len = 5 + rng() * 5;
+        const x2 = x + Math.cos(a) * len;
+        const z2 = z + Math.sin(a) * len;
+        const ex = x2 - x, ez = z2 - z, el2 = ex * ex + ez * ez;
+
+        carve(
+          Math.min(x, x2) - w, Math.max(x, x2) + w,
+          Math.min(z, z2) - w, Math.max(z, z2) + w,
+          (px, pz) => {
+            let u = ((px - x) * ex + (pz - z) * ez) / el2;
+            u = Math.max(0, Math.min(1, u));
+            const dist = Math.hypot(px - (x + ex * u), pz - (z + ez * u));
+            const t = 1 - dist / w;
+            return t > 0 ? D * profile(t) : 0;
+          }
+        );
+
+        x = x2; z = z2;
+        a += (rng() - 0.5) * 1.2;
+      }
+    }
+
+    // Dry spawn area
+    for (let j = 0; j < G; j++) {
+      for (let i = 0; i < G; i++) {
+        const d = Math.hypot(-HALF + i * RES, -HALF + j * RES);
+        if (d < 9) depth[j * G + i] *= smooth(Math.max(0, (d - 5) / 4));
+      }
+    }
+
+    // Final ground height (pool basins + raised/sunken step patches), filled in below
+    const H = new Float32Array(G * G);
+
+    // Ground height lookup (bilinear)
+    POOL.heightAt = function (x, z) {
+
+      const fx = Math.max(0, Math.min(G - 1.001, (x + HALF) / RES));
+      const fz = Math.max(0, Math.min(G - 1.001, (z + HALF) / RES));
+      const i = Math.floor(fx), j = Math.floor(fz);
+      const u = fx - i, v = fz - j;
+
+      const a = H[j * G + i], b = H[j * G + i + 1];
+      const c = H[(j + 1) * G + i], d = H[(j + 1) * G + i + 1];
+
+      return (a * (1 - u) + b * u) * (1 - v) + (c * (1 - u) + d * u) * v;
+    };
+
+    // --------------------------------------
+    // FLOOR (heightfield with pool basins)
+    // --------------------------------------
+
+    function buildFloor() {
+
+      const pos = new Float32Array(G * G * 3);
+      const uvs = new Float32Array(G * G * 2);
+      const col = new Float32Array(G * G * 3);
+      const idx = new Uint32Array((G - 1) * (G - 1) * 6);
+
+      for (let j = 0; j < G; j++) {
+        for (let i = 0; i < G; i++) {
+
+          const k = j * G + i;
+          const x = -HALF + i * RES, z = -HALF + j * RES;
+          const d = Math.max(depth[k], -H[k]);   // wet tint follows the real water depth
+
+          pos[k * 3] = x;
+          pos[k * 3 + 1] = H[k];
+          pos[k * 3 + 2] = z;
+
+          uvs[k * 2] = x / TEX_WORLD;
+          uvs[k * 2 + 1] = z / TEX_WORLD;
+
+          // Wet tint that deepens toward the pool bottom
+          const t = Math.min(1, d / MAX_DEPTH);
+          const wet = d > 0.05 ? 0.12 + 0.88 * t : 0;
+          // Extremely deep basins keep getting darker toward the bottom
+          const abyss = d > MAX_DEPTH ? Math.max(0.12, 1 - (d - MAX_DEPTH) * 0.13) : 1;
+          col[k * 3] = (1 - 0.50 * wet) * abyss;
+          col[k * 3 + 1] = (1 - 0.14 * wet) * abyss;
+          col[k * 3 + 2] = (1 - 0.08 * wet) * abyss;
+        }
+      }
+
+      let q = 0;
+
+      for (let j = 0; j < G - 1; j++) {
+        for (let i = 0; i < G - 1; i++) {
+
+          const a = j * G + i, b = a + 1, c = a + G, d = c + 1;
+
+          idx[q++] = a; idx[q++] = c; idx[q++] = b;
+          idx[q++] = b; idx[q++] = c; idx[q++] = d;
+        }
+      }
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+      geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+      geo.setIndex(new THREE.BufferAttribute(idx, 1));
+      geo.computeVertexNormals();
+
+      const mesh = new THREE.Mesh(geo, floorMat);
+      mesh.frustumCulled = false;
+      scene.add(mesh);
+
+    }
+
+    // --------------------------------------
+    // WATER SURFACE
+    // --------------------------------------
+
+    (function buildWater() {
+
+      const S = 256;
+      const c = document.createElement('canvas');
+      c.width = c.height = S;
+      const x = c.getContext('2d');
+
+      x.fillStyle = '#7fd2d3';
+      x.fillRect(0, 0, S, S);
+      x.lineCap = 'round';
+
+      for (let i = 0; i < 70; i++) {
+
+        const px = Math.random() * S, py = Math.random() * S;
+
+        x.strokeStyle = `rgba(255,255,255,${0.08 + Math.random() * 0.14})`;
+        x.lineWidth = 1 + Math.random() * 2;
+        x.beginPath();
+        x.moveTo(px, py);
+        x.quadraticCurveTo(px + 20, py + (Math.random() - 0.5) * 30, px + 40, py + (Math.random() - 0.5) * 10);
+        x.stroke();
+
+        // wrap copies keep the texture seamless
+        x.translate(S, 0); x.stroke(); x.translate(-S, 0);
+        x.translate(0, S); x.stroke(); x.translate(0, -S);
+      }
+
+      const map = makeTex(c, true);
+      map.repeat.set(WORLD / 6, WORLD / 6);
+
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0x5ec9cb,
+        map,
+        emissive: 0x0c4a4d,
+        roughness: 0.05,
+        metalness: 0.1,
+        transparent: true,
+        opacity: 0.58,
+        depthWrite: false,
+        side: THREE.DoubleSide
+      });
+
+      litPatch(mat);
+
+      const water = new THREE.Mesh(new THREE.PlaneGeometry(WORLD, WORLD), mat);
+      water.rotation.x = -Math.PI / 2;
+      water.position.y = POOL.waterY;
+      water.renderOrder = 2;
+      water.frustumCulled = false;
+      scene.add(water);
+
+      this.water = water;
+
+    }).call(this);
+
+    // --------------------------------------
+    // CEILING
+    // --------------------------------------
+
+    // Each maze cell gets its own ceiling height (separate RNG, so the
+    // existing layout of pools and walls is unchanged).
+    const rng2 = (() => {
+      let sd = 777123;
+      return () => { sd = (sd * 1664525 + 1013904223) >>> 0; return sd / 4294967296; };
+    })();
+
+    const CEIL_NORMAL = 5.3;
+    const CEIL_LOW = [2.3, 2.8];
+    const CEIL_TALL = [7.0, 8.4];
+
+    // Rare, remarkably tall rooms. Their upper part fades to pitch black.
+    const ABYSS_CHANCE = 0.018;
+    const CEIL_ABYSS = [38, 44, 52];
+
+    const m0 = Math.floor(N / 2);
+    const ceilH = Array.from({ length: N }, () => Array(N).fill(CEIL_NORMAL));
+
+    for (let z = 0; z < N; z++) {
+      for (let x = 0; x < N; x++) {
+
+        if (Math.abs(x - m0) <= 1 && Math.abs(z - m0) <= 1) continue;   // spawn stays normal
+
+        // neighbours sometimes share a height, forming larger halls
+        if (x > 0 && rng2() < 0.35) { ceilH[z][x] = ceilH[z][x - 1]; continue; }
+        if (z > 0 && rng2() < 0.35) { ceilH[z][x] = ceilH[z - 1][x]; continue; }
+
+        const r = rng2();
+        if (r < 0.15) ceilH[z][x] = CEIL_LOW[Math.floor(rng2() * CEIL_LOW.length)];
+        else if (r < 0.32) ceilH[z][x] = CEIL_TALL[Math.floor(rng2() * CEIL_TALL.length)];
+      }
+    }
+
+    // Abyss rooms are assigned afterwards (single cells, never near spawn)
+    for (let z = 0; z < N; z++) {
+      for (let x = 0; x < N; x++) {
+        if (Math.abs(x - m0) <= 2 && Math.abs(z - m0) <= 2) continue;
+        if (rng3() < ABYSS_CHANCE) ceilH[z][x] = CEIL_ABYSS[Math.floor(rng3() * CEIL_ABYSS.length)];
+      }
+    }
+
+    POOL.ceilingAt = (x, z) => ceilH[cellOf(z)][cellOf(x)];
+
+    // --------------------------------------
+    // RAISED / SUNKEN FLOOR PATCHES
+    // Small chance per maze cell. A patch is a terraced area whose floor sits
+    // 1 to 5 steps above or below its surroundings, with real stairs around it.
+    // Raised patches are only made where the ceiling leaves enough headroom.
+    // (Sunken ones dip below the water level, so they flood.)
+    // --------------------------------------
+
+    const STEP_H = 0.17;        // height of one step (m)
+    const STEP_RUN = 1.0;       // depth of one step (m)
+    const LIFT_CHANCE = 0.06;   // chance per maze cell
+    const MAX_STEPS = 5;        // biggest height difference, in steps
+    const HEAD_ROOM = 2.15;     // clearance needed above a raised floor (m)
+
+    const rng4 = (() => {
+      let sd = 9182736;
+      return () => { sd = (sd * 1664525 + 1013904223) >>> 0; return sd / 4294967296; };
+    })();
+
+    const lift = new Float32Array(G * G);
+    const patches = [];
+
+    for (let cz = 0; cz < N; cz++) {
+      for (let cx = 0; cx < N; cx++) {
+
+        if (rng4() > LIFT_CHANCE) continue;
+
+        const px = (cx - N / 2 + 0.5) * CELL + (rng4() - 0.5) * 4;
+        const pz = (cz - N / 2 + 0.5) * CELL + (rng4() - 0.5) * 4;
+        let n = 1 + Math.floor(rng4() * MAX_STEPS);
+        let sign = rng4() < 0.5 ? 1 : -1;
+        const rot = rng4() * 6.28;
+        const stretch = 0.85 + rng4() * 0.4;
+        const extra = rng4() * 2.0;
+
+        const Rmax = (n * STEP_RUN + 2.0 + extra) * 1.35;   // widest it could possibly be
+
+        if (Math.hypot(px, pz) < Rmax + 10) continue;                                // spawn stays flat
+        if (patches.some(q => Math.hypot(px - q.x, pz - q.z) < Rmax + q.r + 1.5)) continue;   // never overlap
+
+        // lowest ceiling over the patch
+        let minC = 99;
+        for (let sx = -Rmax; sx <= Rmax; sx += 2.5) {
+          for (let sz = -Rmax; sz <= Rmax; sz += 2.5) {
+            const wx = Math.max(-HALF + 0.1, Math.min(HALF - 0.1, px + sx));
+            const wz = Math.max(-HALF + 0.1, Math.min(HALF - 0.1, pz + sz));
+            minC = Math.min(minC, POOL.ceilingAt(wx, wz));
+          }
+        }
+
+        if (sign > 0) {
+          const maxN = Math.floor((minC - HEAD_ROOM) / STEP_H);
+          if (maxN < 1) sign = -1; else n = Math.min(n, maxN);
+        }
+
+        const R = n * STEP_RUN + 2.0 + extra;
+        const ca = Math.cos(rot), sa = Math.sin(rot);
+
+        patches.push({ x: px, z: pz, r: Rmax });
+
+        const i0 = Math.max(0, Math.floor((px - Rmax + HALF) / RES));
+        const i1 = Math.min(G - 1, Math.ceil((px + Rmax + HALF) / RES));
+        const j0 = Math.max(0, Math.floor((pz - Rmax + HALF) / RES));
+        const j1 = Math.min(G - 1, Math.ceil((pz + Rmax + HALF) / RES));
+
+        for (let j = j0; j <= j1; j++) {
+          for (let i = i0; i <= i1; i++) {
+
+            const dx = -HALF + i * RES - px, dz = -HALF + j * RES - pz;
+            const u = dx * ca + dz * sa;
+            const v = (-dx * sa + dz * ca) * stretch;
+            const rr = R * (1 + 0.1 * Math.sin(3 * Math.atan2(v, u) + rot));
+            const e = rr - Math.hypot(u, v);       // distance inside the edge
+
+            if (e <= 0) continue;
+
+            lift[j * G + i] = sign * Math.min(n, Math.floor(e / STEP_RUN) + 1) * STEP_H;
+          }
+        }
+      }
+    }
+
+    // Final heights. Inside pools the step offset fades out, so basins stay smooth.
+    for (let k = 0; k < G * G; k++) {
+      const dry = 1 - smooth(Math.min(1, depth[k] / 0.6));
+      H[k] = -depth[k] + lift[k] * dry;
+    }
+
+    buildFloor();
+
+    // Slabs run from the ceiling height up to TOP, so there are no gaps above them.
+    const slabGroups = new Map();
+    for (let z = 0; z < N; z++) {
+      for (let x = 0; x < N; x++) {
+        const h = ceilH[z][x];
+        if (!slabGroups.has(h)) slabGroups.set(h, []);
+        slabGroups.get(h).push([(x - N / 2 + 0.5) * CELL, (TOP + h) / 2, (z - N / 2 + 0.5) * CELL]);
+      }
+    }
+    slabGroups.forEach((list, h) => instanced(slabGeo(CELL, TOP - h, CELL), ceilingMat, list));
+
+    // --------------------------------------
+    // MAZE GENERATION
+    // --------------------------------------
+
+    const openH = Array.from({ length: N + 1 }, () => Array(N).fill(false));
+    const openV = Array.from({ length: N }, () => Array(N + 1).fill(false));
+    const seen = Array.from({ length: N }, () => Array(N).fill(false));
+
+    const mid = Math.floor(N / 2);
+    const stack = [[mid, mid]];
+    seen[mid][mid] = true;
+
+    const dirs = [[0, -1, 'N'], [1, 0, 'E'], [0, 1, 'S'], [-1, 0, 'W']];
+
+    while (stack.length) {
+
+      const [x, z] = stack[stack.length - 1];
+
+      const opts = dirs.filter(([dx, dz]) =>
+        x + dx >= 0 && x + dx < N && z + dz >= 0 && z + dz < N && !seen[z + dz][x + dx]
+      );
+
+      if (!opts.length) { stack.pop(); continue; }
+
+      const [dx, dz, direction] = opts[Math.floor(rng() * opts.length)];
+      const nx = x + dx, nz = z + dz;
+
+      seen[nz][nx] = true;
+
+      if (direction === 'N') openH[z][x] = true;
+      if (direction === 'S') openH[z + 1][x] = true;
+      if (direction === 'W') openV[z][x] = true;
+      if (direction === 'E') openV[z][x + 1] = true;
+
+      stack.push([nx, nz]);
+    }
+
+    // Extra openings so the maze has loops and halls
+    for (let z = 1; z < N; z++) for (let x = 0; x < N; x++) if (rng() < 0.2) openH[z][x] = true;
+    for (let z = 0; z < N; z++) for (let x = 1; x < N; x++) if (rng() < 0.2) openV[z][x] = true;
+
+    // --------------------------------------
+    // WALLS (instanced, tiled)
+    // --------------------------------------
+
+    const T = 0.34;
+    const wallsH = [], wallsV = [];
+
+    // Every wall segment is recorded with the ceiling heights of the rooms on
+    // each side (cp = the +side room, cm = the -side room, null if none),
+    // so windows can be placed afterwards.
+    const wallRecs = [];
+
+    function wallH(z, x) {
+      const wx = (x - N / 2 + 0.5) * CELL;
+      const wz = (z - N / 2) * CELL;
+      wallsH.push([wx, WALL_CY, wz]);
+      addSolid(wx - (CELL + T) / 2, wx + (CELL + T) / 2, wz - T / 2, wz + T / 2);
+      wallRecs.push({
+        wx, wz, along: 'x',
+        cp: z < N ? ceilH[z][x] : null,
+        cm: z > 0 ? ceilH[z - 1][x] : null
+      });
+    }
+
+    function wallV(z, x) {
+      const wx = (x - N / 2) * CELL;
+      const wz = (z - N / 2 + 0.5) * CELL;
+      wallsV.push([wx, WALL_CY, wz]);
+      addSolid(wx - T / 2, wx + T / 2, wz - (CELL + T) / 2, wz + (CELL + T) / 2);
+      wallRecs.push({
+        wx, wz, along: 'z',
+        cp: x < N ? ceilH[z][x] : null,
+        cm: x > 0 ? ceilH[z][x - 1] : null
+      });
+    }
+
+    for (let x = 0; x < N; x++) { wallH(0, x); wallH(N, x); }
+    for (let z = 0; z < N; z++) { wallV(z, 0); wallV(z, N); }
+
+    for (let z = 1; z < N; z++) for (let x = 0; x < N; x++) if (!openH[z][x]) wallH(z, x);
+    for (let z = 0; z < N; z++) for (let x = 1; x < N; x++) if (!openV[z][x]) wallV(z, x);
+
+    instanced(slabGeo(CELL + T, WALL_H, T), wallMat, wallsH);
+    instanced(slabGeo(T, WALL_H, CELL + T), wallMat, wallsV);
+
+    // --------------------------------------
+    // WINDOWS (sparse, fake infinite sky)
+    // The sky is drawn by a shader from the VIEW DIRECTION only, so it never
+    // changes with position: no parallax, which reads as infinitely far.
+    // Nothing exists behind the wall; it is purely an illusion.
+    // --------------------------------------
+
+    const WINDOW_CHANCE = 0.04;   // per wall segment
+
+    const skyMat = new THREE.ShaderMaterial({
+      uniforms: { uTime: { value: 0 } },
+      vertexShader: `
+        varying vec3 vW;
+        void main() {
+          vec4 wp = modelMatrix * vec4(position, 1.0);
+          vW = wp.xyz;
+          gl_Position = projectionMatrix * viewMatrix * wp;
+        }`,
+      fragmentShader: `
+        uniform float uTime;
+        varying vec3 vW;
+
+        float h21(vec2 p) {
+          p = fract(p * vec2(123.34, 456.21));
+          p += dot(p, p + 45.32);
+          return fract(p.x * p.y);
+        }
+        float vn(vec2 p) {
+          vec2 i = floor(p), f = fract(p);
+          f = f * f * (3.0 - 2.0 * f);
+          return mix(mix(h21(i), h21(i + vec2(1.0, 0.0)), f.x),
+                     mix(h21(i + vec2(0.0, 1.0)), h21(i + vec2(1.0, 1.0)), f.x), f.y);
+        }
+        float fbm(vec2 p) {
+          float a = 0.5, s = 0.0;
+          for (int i = 0; i < 5; i++) { s += a * vn(p); p = p * 2.03 + 17.1; a *= 0.5; }
+          return s;
+        }
+
+        void main() {
+          vec3 d = normalize(vW - cameraPosition);
+          float h = d.y;
+
+          vec3 horizon = vec3(0.86, 0.94, 1.0);
+          vec3 zenith  = vec3(0.26, 0.52, 0.92);
+          vec3 col = mix(horizon, zenith, pow(clamp(h, 0.0, 1.0), 0.45));
+          col = mix(col, vec3(0.78, 0.88, 0.95), smoothstep(0.0, 0.25, -h));
+
+          vec3 sun = normalize(vec3(0.35, 0.28, -0.55));
+          float sd = max(dot(d, sun), 0.0);
+          col += vec3(1.0, 0.88, 0.65) * (pow(sd, 900.0) * 3.0 + pow(sd, 24.0) * 0.25);
+
+          vec2 cp = d.xz / (max(h, 0.0) + 0.12) * 1.1 + vec2(uTime * 0.012, uTime * 0.006);
+          float c = smoothstep(0.48, 0.78, fbm(cp));
+          c *= smoothstep(0.0, 0.18, h);
+          col = mix(col, vec3(1.0), c * 0.85);
+
+          gl_FragColor = vec4(col, 1.0);
+        }`
+    });
+    this.skyMat = skyMat;
+
+    const frameMat = new THREE.MeshStandardMaterial({ color: 0xdfe9e7, roughness: 0.5 });
+    litPatch(frameMat);
+
+    const boxG = new THREE.BoxGeometry(1, 1, 1);
+
+    function frameBox(group, w, h, d, x, y, z) {
+      const m = new THREE.Mesh(boxG, frameMat);
+      m.scale.set(w, h, d);
+      m.position.set(x, y, z);
+      group.add(m);
+    }
+
+    function buildWindowSide(rec, side, a, cy, w, h) {
+
+      const g = new THREE.Group();
+      const off = side * (T / 2);
+
+      if (rec.along === 'x') {
+        g.position.set(rec.wx + a, cy, rec.wz + off);
+        g.rotation.y = side > 0 ? 0 : Math.PI;
+      } else {
+        g.position.set(rec.wx + off, cy, rec.wz + a);
+        g.rotation.y = side > 0 ? Math.PI / 2 : -Math.PI / 2;
+      }
+
+      // the sky itself (local +z points out of the wall)
+      const sky = new THREE.Mesh(new THREE.PlaneGeometry(w, h), skyMat);
+      sky.position.z = 0.006;
+      g.add(sky);
+
+      // frame
+      const ft = 0.12, fd = 0.1;
+      frameBox(g, w + ft * 2, ft, fd, 0, h / 2 + ft / 2, fd / 2);
+      frameBox(g, w + ft * 2, ft * 1.6, fd * 1.8, 0, -h / 2 - ft * 0.8, fd * 0.9);   // sill
+      frameBox(g, ft, h, fd, -w / 2 - ft / 2, 0, fd / 2);
+      frameBox(g, ft, h, fd, w / 2 + ft / 2, 0, fd / 2);
+      if (w > 2.6) frameBox(g, ft * 0.7, h, fd * 0.8, 0, 0, fd * 0.4);                 // mullion
+
+      // horizontal bars on the tall panes
+      const bars = Math.floor(h / 2.6);
+      for (let i = 1; i <= bars; i++) frameBox(g, w, ft * 0.7, fd * 0.8, 0, -h / 2 + h * i / (bars + 1), fd * 0.4);
+
+      scene.add(g);
+    }
+
+    wallRecs.forEach((rec) => {
+
+      if (rng3() > WINDOW_CHANCE) return;
+      if (Math.hypot(rec.wx, rec.wz) < 12) return;   // none right at spawn
+
+      const sides = [];
+      if (rec.cp !== null) sides.push(1);
+      if (rec.cm !== null) sides.push(-1);
+      if (!sides.length) return;
+
+      const lowest = Math.min(...sides.map(s => (s > 0 ? rec.cp : rec.cm)));
+
+      const w = 1.6 + rng3() * 2.4;
+      rng3(); rng3();                                // keeps the random sequence (and window layout) unchanged
+      const a = (rng3() - 0.5) * (CELL - w - 1.5);
+
+      // Almost floor-to-ceiling: starts just above the floor, stops just under
+      // the lowest ceiling of the two rooms (capped at 8 m in the very tall halls).
+      const sill = 0.25;
+      const top = Math.min(lowest - 0.3, 8.0);
+      const h = top - sill;
+      const cy = sill + h / 2;
+
+      if (h < 1.5) return;
+
+      sides.forEach(s => buildWindowSide(rec, s, a, cy, w, h));
+    });
+
+    // --------------------------------------
+    // PILLARS
+    // --------------------------------------
+
+    const pillarGeo = new THREE.CylinderGeometry(0.32, 0.32, WALL_H, 16, 1);
+
+    for (let i = 0; i < 70; i++) {
+
+      const cx = Math.floor(rng() * N), cz = Math.floor(rng() * N);
+      const x = (cx - N / 2 + 0.5) * CELL + (rng() - 0.5) * 5;
+      const z = (cz - N / 2 + 0.5) * CELL + (rng() - 0.5) * 5;
+
+      if (Math.hypot(x, z) < 4) continue;
+
+      const m = new THREE.Mesh(pillarGeo, pillarMat);
+      m.position.set(x, WALL_CY, z);
+      scene.add(m);
+
+      addSolid(x - 0.32, x + 0.32, z - 0.32, z + 0.32);
+    }
+
+    // --------------------------------------
+    // PIPES (rare, mostly hugging the walls)
+    // --------------------------------------
+
+    const PIPE_CHANCE = 0.04;   // chance per wall segment
+
+    const pipeMats = [0xaebfbb, 0xb0734a, 0x8fa7b0].map(c =>
+      new THREE.MeshStandardMaterial({ color: c, roughness: 0.5, metalness: 0.15 }));
+    pipeMats.forEach(litPatch);
+
+    const cylG = new THREE.CylinderGeometry(1, 1, 1, 12, 1);
+    const ballG = new THREE.SphereGeometry(1, 12, 8);
+
+    function addPipe(x, y, z, len, r, axis, mat) {
+      const m = new THREE.Mesh(cylG, mat);
+      m.scale.set(r, len, r);
+      m.position.set(x, y, z);
+      if (axis === 'x') m.rotation.z = Math.PI / 2;
+      else if (axis === 'z') m.rotation.x = Math.PI / 2;
+      scene.add(m);
+    }
+
+    function addBall(x, y, z, r, mat) {
+      const m = new THREE.Mesh(ballG, mat);
+      m.scale.setScalar(r);
+      m.position.set(x, y, z);
+      scene.add(m);
+    }
+
+    // wx/wz = wall centre, along = axis the wall runs on, side = +1/-1 face, top = ceiling height there
+    function pipeOn(wx, wz, along, side, top) {
+
+      const r = 0.07 + rng2() * 0.06;
+      const mat = pipeMats[Math.floor(rng2() * pipeMats.length)];
+      const off = side * (T / 2 + r + 0.015);
+      const half = CELL / 2 - 0.5;
+      const P = (a, y) => along === 'x' ? [wx + a, y, wz + off] : [wx + off, y, wz + a];
+      const kind = rng2();
+
+      if (kind < 0.45) {
+        // horizontal run along the wall
+        const len = 3 + rng2() * (2 * half - 3);
+        const a = -half + len / 2 + rng2() * (2 * half - len);
+        const y = 0.4 + rng2() * Math.max(0.1, Math.min(top, 3.2) - 1.0);
+        addPipe(...P(a, y), len, r, along, mat);
+        for (let c = -len / 2 + 0.3; c <= len / 2; c += 2.4) addPipe(...P(a + c, y), 0.1, r * 1.45, along, mat);
+
+      } else if (kind < 0.75) {
+        // vertical riser, floor (or pool bottom) to ceiling
+        const a = -half + rng2() * 2 * half;
+        const len = top + 0.1 - BOTTOM;
+        addPipe(...P(a, BOTTOM + len / 2), len, r, 'y', mat);
+        for (let y = 0.6; y < top - 0.2; y += 1.9) addPipe(...P(a, y), 0.1, r * 1.45, 'y', mat);
+
+      } else {
+        // high run that turns up into the ceiling
+        const len = 2 + rng2() * 4;
+        const a = -half + len / 2 + rng2() * (2 * half - len);
+        const y = top - 0.4;
+        const ea = a + (rng2() < 0.5 ? -1 : 1) * len / 2;
+        const vl = top + 0.1 - y;
+        addPipe(...P(a, y), len, r, along, mat);
+        addPipe(...P(ea, y + vl / 2), vl, r, 'y', mat);
+        addBall(...P(ea, y), r * 1.25, mat);
+      }
+    }
+
+    wallsH.forEach(([wx, , wz]) => {
+      if (rng2() > PIPE_CHANCE || Math.hypot(wx, wz) < 8) return;
+      const xi = Math.floor((wx + HALF) / CELL), zl = Math.round((wz + HALF) / CELL);
+      const sides = [];
+      if (zl < N) sides.push(1);
+      if (zl > 0) sides.push(-1);
+      const side = sides[Math.floor(rng2() * sides.length)];
+      const top = ceilH[side > 0 ? zl : zl - 1][xi];
+      if (top > 20) return;   // no pipes up into the black
+      pipeOn(wx, wz, 'x', side, top);
+    });
+
+    wallsV.forEach(([wx, , wz]) => {
+      if (rng2() > PIPE_CHANCE || Math.hypot(wx, wz) < 8) return;
+      const xl = Math.round((wx + HALF) / CELL), zi = Math.floor((wz + HALF) / CELL);
+      const sides = [];
+      if (xl < N) sides.push(1);
+      if (xl > 0) sides.push(-1);
+      const side = sides[Math.floor(rng2() * sides.length)];
+      const top = ceilH[zi][side > 0 ? xl : xl - 1];
+      if (top > 20) return;
+      pipeOn(wx, wz, 'z', side, top);
+    });
+
+    // --------------------------------------
+    // DARK ZONES: a few areas with little or no ambient light
+    // --------------------------------------
+
+    const zones = [];
+    const zoneStrength = [1.0, 0.8, 1.0, 0.65, 0.9, 1.0];   // 1.0 = no light at all
+    let tries = 0;
+
+    while (zones.length < 5 && tries++ < 300) {
+
+      const r = 16 + rng() * 14;
+      const x = (rng() - 0.5) * (WORLD - 20);
+      const z = (rng() - 0.5) * (WORLD - 20);
+
+      if (Math.hypot(x, z) < r + 25) continue;                       // spawn stays lit
+      if (zones.some(q => Math.hypot(x - q.x, z - q.z) < (r + q.r) * 0.9)) continue;
+
+      zones.push({ x, z, r, s: zoneStrength[zones.length] });
+    }
+
+    zones.forEach((q, i) => zoneU.value[i].set(q.x, q.z, q.r, q.s));
+
+    const sstep = (a, b, v) => {
+      const t = Math.max(0, Math.min(1, (v - a) / (b - a)));
+      return t * t * (3 - 2 * t);
+    };
+
+    POOL.lightAt = function (x, z) {
+      let l = 1;
+      for (const q of zones) {
+        const t = 1 - sstep(q.r * 0.55, q.r, Math.hypot(x - q.x, z - q.z));
+        l = Math.min(l, 1 - q.s * t);
+      }
+      return l;
+    };
+
+    // --------------------------------------
+    // CEILING LIGHT PANELS
+    // --------------------------------------
+
+    const panels = [];
+
+    for (let z = 0; z < N; z++) {
+      for (let x = 0; x < N; x++) {
+
+        const on = rng() < 0.82;
+        const px = (x - N / 2 + 0.5) * CELL, pz = (z - N / 2 + 0.5) * CELL;
+
+        // no fixtures in dark areas, and none in the black-topped tall rooms
+        if (on && POOL.lightAt(px, pz) > 0.75 && ceilH[z][x] < 20) panels.push([px, ceilH[z][x] - 0.045, pz]);
+      }
+    }
+
+    instanced(new THREE.BoxGeometry(2.2, 0.08, 1.1), panelMat, panels);
+
+    POOL.limit = HALF - 0.6;
+  },
+
+  tick: function (time) {
+    if (this.water) this.water.material.map.offset.set(time * 0.00002, time * 0.000013);
+    if (this.skyMat) this.skyMat.uniforms.uTime.value = time * 0.001;
+  }
+
+});
+
+
+// ==========================================
+// PLAYER MOVEMENT, POOLS AND FLASHLIGHT
+// ==========================================
+
+AFRAME.registerComponent('explorer', {
+
+  init: function () {
+
+    this.keys = {};
+
+    this.speed = 5.2;
+    this.eyeH = STAND_EYE;
+    this.crouching = false;
+    this.sprinting = false;
+    this.swimming = false;
+    this.sprintLeft = SPRINT_TIME;
+    this.cooldown = 0;
+    this.velocityY = 0;
+    this.onGround = true;
+    this.flashlightOn = false;
+    this.waterDepth = 0;
+    this.underTime = 0;     // seconds spent completely underwater
+    this.darkLevel = 0;     // current overlay opacity
+    this.stepDist = 0;      // distance walked since the last footstep
+    this.wasGround = true;
+
+    this.camera = document.querySelector('#camera');
+    this.flashlight = document.querySelector('#flashlight');
+    this.status = document.querySelector('#flashStatus');
+    this.depthStatus = document.querySelector('#depthStatus');
+    this.areaStatus = document.querySelector('#areaStatus');
+    this.sprintStatus = document.querySelector('#sprintStatus');
+    this.stanceStatus = document.querySelector('#stanceStatus');
+    this.darkEl = document.querySelector('#dark');
+
+    this.fog = null;
+    this.underwater = false;
+
+    this.updateFlashlight();
+
+    // Flashlight cone sized so its circle covers about 35% of the screen,
+    // whatever the window shape (A-Frame spot angle is in degrees).
+    this.updateBeam = () => {
+      const cam = this.camera.getAttribute('camera');
+      const fov = ((cam && cam.fov) || 74) * Math.PI / 180;
+      const aspect = window.innerWidth / window.innerHeight;
+      const th = Math.tan(fov / 2);
+      const r = Math.sqrt(BEAM_COVER * 4 * th * th * aspect / Math.PI);
+      this.flashlight.setAttribute('light', 'angle', Math.atan(r) * 180 / Math.PI);
+    };
+
+    this.updateBeam();
+    window.addEventListener('resize', this.updateBeam);
+    this.el.sceneEl.addEventListener('loaded', this.updateBeam);
+
+    this.keyDown = (e) => {
+
+      const key = e.key.toLowerCase();
+
+      if (key === ' ' || key.startsWith('arrow')) e.preventDefault();
+
+      if (key === 'f' && !e.repeat) {
+        this.flashlightOn = !this.flashlightOn;
+        this.updateFlashlight();
+      }
+
+      if (key === ' ' && !e.repeat) this.jump();
+
+      this.keys[key] = true;
+    };
+
+    this.keyUp = (e) => { this.keys[e.key.toLowerCase()] = false; };
+
+    window.addEventListener('keydown', this.keyDown);
+    window.addEventListener('keyup', this.keyUp);
+    this.blur = () => { this.keys = {}; };
+    window.addEventListener('blur', this.blur);
+  },
+
+  updateFlashlight: function () {
+    this.flashlight.setAttribute('light', 'intensity', this.flashlightOn ? FLASH_INTENSITY : 0);
+    this.status.textContent = 'FLASHLIGHT: ' + (this.flashlightOn ? 'ON' : 'OFF');
+  },
+
+  jump: function () {
+    // In deep water, holding Space means swimming, not jumping.
+    if (this.waterDepth > SWIM_MIN) return;
+    if (this.onGround && !this.crouching) {
+      this.velocityY = 6.2 * (this.waterDepth > 0.3 ? 0.6 : 1);
+      this.onGround = false;
+    }
+  },
+
+  tick: function (time, delta) {
+
+    const dt = Math.min(delta / 1000, 0.04);
+
+    if (!this.camera) return;
+
+    const pos = this.el.object3D.position;
+
+    // How deep is the water here? (slows movement)
+    const ground = POOL.heightAt(pos.x, pos.z);
+    const water = Math.max(0, POOL.waterY - ground);
+    this.waterDepth = water;
+
+    // Swimming: hold Space in water deep enough to float in
+    const swimming = !!this.keys[' '] && water > SWIM_MIN;
+    this.swimming = swimming;
+
+    // Wading: a flat 20% slowdown whatever the depth (the short ramp only avoids
+    // a sudden jump at the very edge). Swimming has the same 20% via SWIM_MULT.
+    const wet = Math.min(1, water / 0.12);
+    const slow = swimming ? 1 : 1 - wet * (1 - WATER_MULT);
+
+    // --------------------------------------
+    // WALK
+    // --------------------------------------
+
+    const forward = (this.keys.w ? 1 : 0) - (this.keys.s ? 1 : 0);
+    const side = (this.keys.d ? 1 : 0) - (this.keys.a ? 1 : 0);
+    const length = Math.hypot(forward, side) || 1;
+
+    // Sprint (Shift) and crouch (C); neither applies while swimming
+    const moving = forward !== 0 || side !== 0;
+    this.crouching = !!this.keys.c && !swimming;
+
+    if (this.cooldown > 0) {
+      this.cooldown -= dt;
+      if (this.cooldown <= 0) { this.cooldown = 0; this.sprintLeft = SPRINT_TIME; }
+    }
+
+    this.sprinting = !!this.keys.shift && moving && !this.crouching && !swimming && this.cooldown === 0;
+
+    if (this.sprinting) {
+      this.sprintLeft -= dt;
+      if (this.sprintLeft <= 0) {
+        this.sprintLeft = 0;
+        this.sprinting = false;
+        this.cooldown = SPRINT_COOLDOWN;
+      }
+    } else if (this.cooldown === 0) {
+      this.sprintLeft = Math.min(SPRINT_TIME, this.sprintLeft + dt * 0.5);   // slow recovery if you stop early
+    }
+
+    const gait = swimming ? SWIM_MULT : this.crouching ? CROUCH_MULT : this.sprinting ? SPRINT_MULT : 1;
+
+    const ox = pos.x, oz = pos.z;   // for footstep distance
+
+    const yaw = this.camera.object3D.rotation.y;
+
+    const forwardX = -Math.sin(yaw), forwardZ = -Math.cos(yaw);
+    const rightX = Math.cos(yaw), rightZ = -Math.sin(yaw);
+
+    const moveX = (forwardX * forward + rightX * side) / length;
+    const moveZ = (forwardZ * forward + rightZ * side) / length;
+
+    let nx = pos.x + moveX * this.speed * slow * gait * dt;
+    let nz = pos.z + moveZ * this.speed * slow * gait * dt;
+
+    [nx, nz] = POOL.collide(nx, nz, 0.35);
+
+    pos.x = Math.max(-POOL.limit, Math.min(POOL.limit, nx));
+    pos.z = Math.max(-POOL.limit, Math.min(POOL.limit, nz));
+
+    // --------------------------------------
+    // VERTICAL (follows the pool floor, or floats when swimming)
+    // --------------------------------------
+
+    const gy = POOL.heightAt(pos.x, pos.z);
+
+    if (swimming) {
+      // Buoyancy: rise to the surface and hold there, eyes just above the water
+      const targetY = Math.max(gy, POOL.waterY + SWIM_SURFACE_EYE - STAND_EYE);
+      this.velocityY = Math.max(-2.5, Math.min(3.0, (targetY - pos.y) * 5));
+      this.onGround = false;
+    } else {
+      this.velocityY -= (water > 0.3 ? 8 : 15) * dt;
+      // In deep water you sink slowly instead of dropping like a stone
+      if (water > SWIM_MIN) this.velocityY = Math.max(this.velocityY, -SINK_SPEED);
+    }
+
+    pos.y += this.velocityY * dt;
+
+    if (pos.y <= gy) {
+      pos.y = gy;
+      this.velocityY = 0;
+      this.onGround = true;
+    } else if (!swimming && this.onGround && pos.y - gy < 0.35 && this.velocityY <= 0) {
+      pos.y = gy;               // stick to downward slopes
+      this.velocityY = 0;
+    } else {
+      this.onGround = false;
+    }
+
+    // --------------------------------------
+    // FOOTSTEPS
+    // --------------------------------------
+
+    const stride = this.crouching ? 1.2 : this.sprinting ? 2.3 : 1.8;
+    const moved = Math.hypot(pos.x - ox, pos.z - oz);
+    const walkable = this.onGround && !swimming && water < SWIM_MIN;
+    const stepVol = this.crouching ? 0.35 : this.sprinting ? 1.0 : 0.7;
+
+    if (walkable && moved > 0.0004) {
+      this.stepDist += moved;
+      if (this.stepDist >= stride) {
+        this.stepDist = 0;
+        Sound.step(water > 0.04, stepVol);
+      }
+    } else if (walkable) {
+      this.stepDist = stride * 0.6;     // first step comes quickly after you start moving
+    }
+
+    if (walkable && !this.wasGround) Sound.step(water > 0.04, 0.9);   // landing
+    this.wasGround = this.onGround;
+
+    // --------------------------------------
+    // EYE HEIGHT, CEILING AND UNDERWATER LOOK
+    // --------------------------------------
+
+    // Eye height (crouch) and low-ceiling head bump
+    const ceil = POOL.ceilingAt(pos.x, pos.z);
+    const targetEye = this.crouching ? CROUCH_EYE : STAND_EYE;
+    this.eyeH += (targetEye - this.eyeH) * Math.min(1, dt * 12);
+    this.camera.object3D.position.y = this.eyeH;
+
+    const maxY = ceil - this.eyeH - 0.15;
+    if (pos.y > maxY) {
+      pos.y = maxY;
+      if (this.velocityY > 0) this.velocityY = 0;
+    }
+
+    const eye = pos.y + this.eyeH;
+    const under = eye < POOL.waterY;     // completely underwater
+
+    if (!this.fog) this.fog = this.el.sceneEl.object3D.fog;
+
+    if (this.fog && under !== this.underwater) {
+      this.underwater = under;
+      Sound.setMuffled(under);
+      this.fog.color.set(under ? 0x0d5a60 : 0x050d0e);
+      this.fog.density = under ? 0.12 : 0.011;
+      this.el.sceneEl.object3D.background = new THREE.Color(under ? 0x0d5a60 : 0x050d0e);
+    }
+
+    // Gradual darkening while completely underwater; clears once you surface
+    if (under) {
+      this.underTime += dt;
+      const k = Math.min(1, this.underTime / DARKEN_TIME);
+      this.darkLevel = Math.max(this.darkLevel, smoothDark(k) * DARKEN_MAX);
+    } else {
+      this.underTime = 0;
+      this.darkLevel = Math.max(0, this.darkLevel - dt * DARKEN_RECOVER);
+    }
+    if (this.darkEl) this.darkEl.style.opacity = this.darkLevel.toFixed(3);
+
+    this.sprintStatus.textContent = 'SPRINT: ' + (this.cooldown > 0
+      ? 'COOLDOWN ' + this.cooldown.toFixed(1) + 's'
+      : (this.sprinting ? 'ACTIVE ' : 'READY ') + this.sprintLeft.toFixed(1) + 's');
+    this.stanceStatus.textContent = 'STANCE: ' + (swimming ? 'SWIMMING' : this.crouching ? 'CROUCHING' : 'STANDING');
+
+    this.depthStatus.textContent = 'WATER DEPTH: ' + water.toFixed(1) + ' m';
+
+    const lit = POOL.lightAt(pos.x, pos.z);
+    this.areaStatus.textContent = 'AREA: ' + (lit > 0.75 ? 'LIT' : lit > 0.3 ? 'DIM' : 'DARK');
+  },
+
+  remove: function () {
+    window.removeEventListener('keydown', this.keyDown);
+    window.removeEventListener('keyup', this.keyUp);
+    window.removeEventListener('resize', this.updateBeam);
+    window.removeEventListener('blur', this.blur);
+  }
+
+});
+
+function smoothDark(t) { return t * t * (3 - 2 * t); }
+
+
+// ==========================================
+// START GAME
+// ==========================================
+
+document.querySelector('#begin').addEventListener('click', () => {
+
+  document.querySelector('#start').style.display = 'none';
+
+  Sound.init();
+
+  const canvas = document.querySelector('a-scene').canvas;
+
+  if (canvas) canvas.requestPointerLock?.();
+
+});
+
+</script>
+
+</body>
+</html>
